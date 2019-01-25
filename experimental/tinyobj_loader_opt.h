@@ -312,6 +312,10 @@ typedef struct {
 
 typedef struct {
   std::string name;  // group name or object name.
+  // Shape's corresponding faces are accessed by attrib.indices[face_offset,
+  // face_offset + length] NOTE: you'll need to sum up
+  // attrib.face_num_verts[face_offset, face_offset + length] to find actual
+  // number of faces.
   unsigned int face_offset;
   unsigned int length;
 } shape_t;
@@ -330,7 +334,14 @@ typedef struct {
   std::vector<float, lfpAlloc::lfpAllocator<float> > normals;
   std::vector<float, lfpAlloc::lfpAllocator<float> > texcoords;
   std::vector<index_t, lfpAlloc::lfpAllocator<index_t> > indices;
+
+  // # of vertices for each face.
+  // 3 for triangle, 4 for qual, ...
+  // If triangulation is enabled and the original face are quad,
+  // face_num_verts will be 6(3 + 3)
   std::vector<int, lfpAlloc::lfpAllocator<int> > face_num_verts;
+
+  // Per-face material IDs.
   std::vector<int, lfpAlloc::lfpAllocator<int> > material_ids;
 } attrib_t;
 
@@ -594,19 +605,9 @@ static bool tryParseDouble(const char *s, const char *s_end, double *result) {
   }
 
 assemble :
-
-{
-  // = pow(5.0, exponent);
-  double a = 1.0;
-  for (int i = 0; i < exponent; i++) {
-    a = a * 5.0;
-  }
-  *result =
-      //(sign == '+' ? 1 : -1) * ldexp(mantissa * pow(5.0, exponent), exponent);
-      (sign == '+' ? 1 : -1) * (mantissa * a) *
-      static_cast<double>(1ULL << exponent);  // 5.0^exponent * 2^exponent
-}
-
+  *result = (sign == '+' ? 1 : -1) *
+            (exponent ? std::ldexp(mantissa * std::pow(5.0, exponent), exponent)
+                      : mantissa);
   return true;
 fail:
   return false;
@@ -1046,7 +1047,7 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
               std::vector<material_t> *materials, const char *buf, size_t len,
               const LoadOption &option);
 
-} // namespace tinyobj_opt
+}  // namespace tinyobj_opt
 
 #endif  // TINOBJ_LOADER_OPT_H_
 
@@ -1238,6 +1239,8 @@ typedef struct {
 // 3. Do parallel parsing for each line.
 // 4. Reconstruct final mesh data structure.
 
+// Raise # of max threads if you have more CPU cores...
+// In 2018, 32 cores are getting common in high-end workstaion PC.
 #define kMaxThreads (32)
 
 static inline bool is_line_ending(const char *p, size_t i, size_t end_i) {
@@ -1306,15 +1309,19 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
           end_idx = len - 1;
         }
 
+        // true if the line currently read must be added to the current line
+        // info
+        bool new_line_found =
+            (t == 0) || is_line_ending(buf, start_idx - 1, end_idx);
+
         size_t prev_pos = start_idx;
         for (size_t i = start_idx; i < end_idx; i++) {
           if (is_line_ending(buf, i, end_idx)) {
-            if ((t > 0) && (prev_pos == start_idx) &&
-                (!is_line_ending(buf, start_idx - 1, end_idx))) {
+            if (!new_line_found) {
               // first linebreak found in (chunk > 0), and a line before this
               // linebreak belongs to previous chunk, so skip it.
               prev_pos = i + 1;
-              continue;
+              new_line_found = true;
             } else {
               LineInfo info;
               info.pos = prev_pos;
@@ -1329,11 +1336,11 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
           }
         }
 
-        // Find extra line which spand across chunk boundary.
-        if ((t < num_threads) && (buf[end_idx - 1] != '\n')) {
-          auto extra_span_idx = (std::min)(end_idx - 1 + chunk_size, len);
-          for (size_t i = end_idx; i < extra_span_idx; i++) {
-            if (is_line_ending(buf, i, extra_span_idx)) {
+        // If at least one line started in this chunk, find where it ends in the
+        // rest of the buffer
+        if (new_line_found && (t < num_threads) && (buf[end_idx - 1] != '\n')) {
+          for (size_t i = end_idx; i < len; i++) {
+            if (is_line_ending(buf, i, len)) {
               LineInfo info;
               info.pos = prev_pos;
               info.len = i - prev_pos;
@@ -1390,7 +1397,6 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
 
     for (size_t t = 0; t < num_threads; t++) {
       workers->push_back(std::thread([&, t]() {
-
         for (size_t i = 0; i < line_infos[t].size(); i++) {
           Command command;
           bool ret = parseLine(&command, &buf[line_infos[t][i].pos],
@@ -1408,14 +1414,14 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
             }
 
             if (command.type == COMMAND_MTLLIB) {
+              // Save the indices of the `mtllib` command in `commands` to easily find it later
               mtllib_t_index = t;
-              mtllib_i_index = commands->size();
+              mtllib_i_index = commands[t].size();
             }
 
             commands[t].emplace_back(std::move(command));
           }
         }
-
       }));
     }
 
@@ -1440,7 +1446,9 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
     // std::cout << "mtllib :" << material_filename << std::endl;
 
     auto t1 = std::chrono::high_resolution_clock::now();
-
+    if (material_filename.back() == '\r') {
+      material_filename.pop_back();
+    }
     std::ifstream ifs(material_filename);
     if (ifs.good()) {
       LoadMtl(&material_map, materials, &ifs);
@@ -1491,7 +1499,7 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
     attrib->texcoords.resize(num_vt * 2);
     attrib->indices.resize(num_f);
     attrib->face_num_verts.resize(num_indices);
-    attrib->material_ids.resize(num_indices);
+    attrib->material_ids.resize(num_indices, -1);
 
     size_t v_offsets[kMaxThreads];
     size_t n_offsets[kMaxThreads];
@@ -1516,7 +1524,6 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
     StackVector<std::thread, 16> workers;
 
     for (size_t t = 0; t < num_threads; t++) {
-      int material_id = -1;  // -1 = default unknown material.
       workers->push_back(std::thread([&, t]() {
         size_t v_count = v_offsets[t];
         size_t n_count = n_offsets[t];
@@ -1529,15 +1536,40 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
             continue;
           } else if (commands[t][i].type == COMMAND_USEMTL) {
             if (commands[t][i].material_name &&
-                commands[t][i].material_name_len > 0) {
-              std::string material_name(commands[t][i].material_name,
-                                        commands[t][i].material_name_len);
-
-              if (material_map.find(material_name) != material_map.end()) {
-                material_id = material_map[material_name];
-              } else {
-                // Assign invalid material ID
-                material_id = -1;
+                commands[t][i].material_name_len > 0 &&
+                // check if there are still faces after this command
+                face_count < num_indices) {
+              // Find next face
+              bool found = false;
+              size_t i_start = i + 1, t_next, i_next;
+              for (t_next = t; t_next < num_threads; t_next++) {
+                for (i_next = i_start; i_next < commands[t_next].size();
+                     i_next++) {
+                  if (commands[t_next][i_next].type == COMMAND_F) {
+                    found = true;
+                    break;
+                  }
+                }
+                if (found) break;
+                i_start = 0;
+              }
+              // Assign material to this face
+              if (found) {
+                std::string material_name(commands[t][i].material_name,
+                                          commands[t][i].material_name_len);
+                for (size_t k = 0;
+                     k < commands[t_next][i_next].f_num_verts.size(); k++) {
+                  if (material_map.find(material_name) != material_map.end()) {
+                    attrib->material_ids[face_count + k] =
+                        material_map[material_name];
+                  } else {
+                    // Assign invalid material ID
+                    // Set a different value than the default, to
+                    // prevent following faces from being assigned a valid
+                    // material
+                    attrib->material_ids[face_count + k] = -2;
+                  }
+                }
               }
             }
           } else if (commands[t][i].type == COMMAND_V) {
@@ -1564,7 +1596,6 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
                   index_t(vertex_index, texcoord_index, normal_index);
             }
             for (size_t k = 0; k < commands[t][i].f_num_verts.size(); k++) {
-              attrib->material_ids[face_count + k] = material_id;
               attrib->face_num_verts[face_count + k] =
                   commands[t][i].f_num_verts[k];
             }
@@ -1579,6 +1610,12 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
     for (size_t t = 0; t < workers->size(); t++) {
       workers[t].join();
     }
+
+    // To each face with uninitialized material id,
+    // assign the material id of the last face preceding it that has one
+    for (size_t face_count = 1; face_count < num_indices; ++face_count)
+      if (attrib->material_ids[face_count] == -1)
+        attrib->material_ids[face_count] = attrib->material_ids[face_count - 1];
 
     auto t_end = std::chrono::high_resolution_clock::now();
     ms_merge = t_end - t_start;
@@ -1639,7 +1676,8 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
           }
         }
         if (commands[t][i].type == COMMAND_F) {
-          face_count++;
+          // Consider generation of multiple faces per `f` line by triangulation
+          face_count += commands[t][i].f_num_verts.size();
         }
       }
     }
